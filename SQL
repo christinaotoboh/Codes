@@ -1,0 +1,137 @@
+USE [dbname]
+GO
+/****** Object:  StoredProcedure [dbo].[RecociliationReport1]    Script Date: 23/06/2022 12:54:54 PM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+--exec [dbo].[RecociliationReport1] @businessid=76,@shipmentid='',@startdate='2022-05-21',@enddate='2022-06-22'
+ALTER Proc [dbo].[RecociliationReport1] 
+--declare
+@businessid int,   
+@startdate date='',
+@enddate date='',
+@shipmentid varchar(20)=''   
+--@pageNo int=1,      
+--@recordsPerPage int=100      ,
+--@status varchar(100)='',
+--@flag int=0
+as
+begin                            
+Set Nocount On    
+create table #bid(businessid int)
+if @startdate =''
+begin
+set @startdate=convert(date,DATEADD(month, DATEDIFF(month, 0,getdate()), 0),126)
+set @enddate=convert(date,dateadd(day,-1,getdate()),126)
+set @businessid=[dbo].[Fn_getBusinessid](@businessid)
+end
+if @businessid=[dbo].[Fn_getBusinessid](@businessid)
+begin
+insert into #bid 
+select Stock_Point_ID from Stock_Point_Master
+end
+else
+begin
+insert into #bid values (@businessid)
+end
+create table #packgeorderall (OrderID int, PackageListID varchar(20), Createddate datetime, DriverAssignedDate datetime)
+if @shipmentid=''
+begin
+insert into #packgeorderall
+select OrderID , PackageListID, Createddate, DriverAssignedDate 
+from OrderPackageList with (nolock) where Status=1 and convert(date,DriverAssignedDate,126)>=@startdate and convert(date,DriverAssignedDate,126)<=@enddate 
+and businessid in (select businessid from #bid)
+end
+else
+insert into #packgeorderall
+select OrderID , PackageListID, Createddate, DriverAssignedDate 
+from OrderPackageList with (nolock) where Status=1 and PackageListID in (@shipmentid) and convert(date,DriverAssignedDate,126)>=@startdate and convert(date,DriverAssignedDate,126)<=@enddate 
+and businessid in (select businessid from #bid)
+select masterorderid,Contentid, Createddate, TotalPrice,CustomerID,OrderStatusID,SOnumber,WaybillNumber,Businessid ,orderlocationid into #orders 
+from vconnectmasterPOS..ordermaster with (nolock)
+where businessid in (select businessid from #bid) and contentID in (select distinct orderid from #packgeorderall)    
+select businessid,a.PackageListID,a.OrderID,b.ShipmentStatus,DriverID into #shipmentdetails 
+from OrderPackageList a join ShipmentStatusMaster b on a.ShipmentStatus=b.contentid 
+where PackageListID in (select PackageListID from #packgeorderall) and businessid in (select businessid from #bid)
+
+--Financemanager
+select businessid,ShipmentId,Createddate,financemanageramount into #financemanageramount from paymentReconcilationDetails where financemanageramount is not null 
+and ShipmentId in (select PackageListID from #packgeorderall) and status=1
+and businessid in (select businessid from #bid)
+order by 1 desc
+
+
+--select  * into #ShipmentStatusDetails from ShipmentStatusDetails where shipmentid in (select distinct PackageListID from #shipmentdetails)
+--select * from #ShipmentStatusDetails1
+--select * into #ShipmentStatusDetails1 from #ShipmentStatusDetails s where createddate = (select max(createddate) from #ShipmentStatusDetails where shipmentid = s.shipmentid)
+select userid,AgentName into #recomgrs from businessuserrole where status = 1 and roleid in (select contentid from rolemaster where rolename ='Reconciliation Manager' and status = 1)
+select * into #recodetails from (
+select DISTINCT null as uniqueid,shipment_id,(select min(DriverAssignedDate) from #packgeorderall WHERE PackageListID = shipment_id) Shipment_Date,amount,bank_name, 
+(SELECT max(createdDate) FROM ShipmentStatusDetails where shipmentStatusID IN (7,8) AND shipmentid = shipment_id and createdby = r.created_by) 'Reconciliation date',
+(SELECT max(ShipmentStatusId) FROM ShipmentStatusDetails where shipmentid = shipment_id) ShipmentStatus,
+--(SELECT top 1 createdby FROM ShipmentStatusDetails where shipmentid = shipment_id and shipmentStatusID IN (7,8) and createdby in (select userid from #recomgrs)) ShipmentStatus,
+created_by,
+(select top 1 AgentName from #recomgrs where userid=created_by) RecoManager,
+--(SELECT ShipmentStatusId FROM ShipmentStatusDetails where shipmentid = shipment_id and createdDate = MAX(createdDate) and shipmentStatusID IN (7,8) ) ShipmentStatus,
+row_number()over(partition by shipment_id,Bank_Name order by Bank_Name) rnk
+from Reconcilation_Deposit(nolock) r join bank_account_Details b on  b.id = Bank_account_Details_ID
+where shipment_id in (select distinct PackageListID from #shipmentdetails) 
+and r.status = 1 
+union all 
+--virtual account
+select DISTINCT p.Payment_Status_ID,Shipment_ID,(select min(DriverAssignedDate) from OrderPackageList WHERE PackageListID = shipment_id) Shipment_Date, Virtual_Account_Amount AS amount,'Virtual Account Transfer',
+(SELECT MAX(createdDate) FROM ShipmentStatusDetails where shipmentStatusID IN (7,8) AND shipmentid = shipment_id) 'Reconciliation date', 
+(SELECT max(ShipmentStatusId) FROM ShipmentStatusDetails where shipmentid = shipment_id) ShipmentStatus, rm.ReconcileManagerId as RecomgrID,
+(select top 1 AgentName from #recomgrs where userid=rm.ReconcileManagerId) RecoMgr,''
+from vconnectmasterpos..Payment_Status_Log (nolock) p LEFT JOIN ReconcilationMaster(NOLOCK) rm ON rm.ShipmentListId = p.Shipment_Id 
+where Shipment_ID in (select PackageListID from #shipmentdetails) 
+and IsPaid =1 
+and Payment_Type_Id in (1,2,3)
+and isnull(rm.Status,0) in (0,1,5)   --Added on 12may2022 
+---That is sum(amount) from payment_Status_log where ispaid = 1 + SUM(amount) from Reconcilation_Deposit where status = 1 + amount from Reconcilation_cash
+/*union all
+---cash transactions
+select Shipment_ID,(select max(DriverAssignedDate) from OrderPackageList WHERE PackageListID = shipment_id) Shipment_Date,amount,'Cash Transaction1',
+(SELECT MAX(createdDate) FROM ShipmentStatusDetails where shipmentStatusID IN (7,8) AND shipmentid = shipment_id) 'Reconciliation date'
+from vconnectmasterpos..Payment_Status_Log with (nolock) where Shipment_ID in (select PackageListID from #shipmentdata)
+and IsPaid in (4,99) */
+union all 
+---cash transactions
+select DISTINCT null as uniqueid,Shipment_ID,(select min(DriverAssignedDate) from OrderPackageList WHERE PackageListID = shipment_id) Shipment_Date,amount,'Cash Transaction',
+(SELECT MAX(createdDate) FROM ShipmentStatusDetails where shipmentStatusID IN (7,8) AND shipmentid = shipment_id and CreatedBy = r.Created_By) 'Reconciliation date',
+(SELECT max(ShipmentStatusId) FROM ShipmentStatusDetails where shipmentid = shipment_id) shipmentstatus,created_by,
+(select top 1 AgentName from #recomgrs where userid=created_by) RecoManager, ''
+from reconcilation_cash r with (nolock)  where Shipment_ID in (select packagelistid from #shipmentdetails))d 
+--select * from #recodetails order by Shipment_ID
+/* FOR TESTS
+select (isnull(sum_paymentlog,0)+isnull(sum_recodeposit,0)+isnull(sum_recocash,0)) as summ from (
+select PackageListID, (select SUM(isnull(amount,0)) from vconnectmasterpos..Payment_Status_Log with (nolock) where shipment_id = PackageListID and ispaid = 1) sum_paymentlog, 
+(select SUM(isnull(amount,0)) from Reconcilation_Deposit where shipment_id = PackageListID and status = 1) sum_recodeposit, 
+(select SUM(isnull(amount,0)) from reconcilation_cash with (nolock) where Shipment_ID = PackageListID) sum_recocash
+from #shipmentdetails where PackageListID = 'PKNO20-303208'
+group by PackageListID)d where PackageListID = 'PKNO11-292997'*/
+select distinct s.BusinessID, s.DriverID,(select contactname from userdetails where contentid = s.DriverID) Drivername, Shipment_ID ShipmentID,r.shipmentstatus shipmentstatusid,
+sS.shipmentstatus, r.Shipment_Date, deliveryvalue Amount_Expected, AmountCollected,
+r.Amount,
+concat(r.Bank_Name,rnk) 'BankName/Channel', [Reconciliation date] Reconciliation_Date,r.RecoManager,fm.FinanceManagerAmount,
+r.uniqueid
+into #finaldata
+from #recodetails r  join #shipmentdetails s on r.Shipment_ID = s.PackageListID 
+left outer join #financemanageramount fm on fm.ShipmentId=r.Shipment_Id
+LEFT OUTER JOIN ShipmentStatusMaster(NOLOCK) SS ON R.ShipmentStatus = SS.Contentid
+LEFT OUTER JOIN ReconcilationMaster(NOLOCK) RM ON R.Shipment_Id = RM.ShipmentListId and rm.status=1
+
+--SELECT TOP 5 * FROM ReconcilationMaster
+select * from #finaldata order by ShipmentID----where shipmentid like '%'+@shipmentid+'%'
+drop table if exists #recodetails
+drop table if exists #shipmentdetails
+drop table if exists #bid
+drop table if exists #packgeorderall
+drop table if exists #orders
+drop table if exists #finaldata
+drop table if exists #ShipmentStatusDetails
+drop table if exists #recomgrs
+drop table if exists #financemanageramount
+Set Nocount Off                            
+End
